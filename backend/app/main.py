@@ -10,7 +10,6 @@ from fastapi.responses import Response, StreamingResponse
 
 from backend.app.config.settings import API_TITLE, API_VERSION, UPLOADS_DIR
 from backend.app.database.database import get_connection, init_db
-from backend.app.ml.training.bootstrap import ensure_models
 from backend.app.schemas.models import (
     ChatHistoryResponse,
     ChatRequest,
@@ -699,11 +698,11 @@ def _resolve_report_context(
 
 @app.on_event("startup")
 def _startup_bootstrap() -> None:
-    # Keep model bootstrap during startup.
-    # The RAG index is intentionally NOT built here because
-    # SentenceTransformer/PyTorch can exceed Render's 512 MB
-    # free-instance memory limit.
-    ensure_models()
+    # Models are trained during the Render build phase.
+    # Do not train models or initialize the RAG index during
+    # runtime startup because the free Render instance has
+    # a 512 MiB memory limit.
+    pass
 
 
 # ---------------------------------------------------------------------------
