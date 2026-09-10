@@ -9,7 +9,6 @@ import requests
 from backend.app.config.settings import GROQ_API_KEY
 from backend.app.services.settings_service import get_settings
 from backend.app.ml.prompts.templates import (
-    BASE_SYSTEM_PROMPT,
     build_chat_messages,
     build_lifestyle_prompt,
     build_report_explanation_prompt,
@@ -17,6 +16,19 @@ from backend.app.ml.prompts.templates import (
 
 
 class LLMService:
+    """
+    Central LLM service for MediLens.
+
+    Provider priority:
+        1. Groq
+        2. OpenAI, if configured
+        3. Ollama, if explicitly configured
+        4. Grounded local fallback
+
+    The fallback keeps the application usable if an external
+    LLM provider is temporarily unavailable.
+    """
+
     def __init__(self, provider: str | None = None) -> None:
         settings = get_settings()
 
@@ -26,8 +38,8 @@ class LLMService:
             or "groq"
         ).lower()
 
-        # Current lightweight Groq production model.
-        # Can be overridden in Render with MEDILENS_GROQ_MODEL.
+        # Current Groq production model.
+        # Can be overridden with MEDILENS_GROQ_MODEL.
         self.groq_model = os.getenv(
             "MEDILENS_GROQ_MODEL",
             "openai/gpt-oss-20b",
@@ -50,8 +62,6 @@ class LLMService:
             )
         )
 
-        # Prevent an external AI provider from hanging the
-        # Render request indefinitely.
         self.request_timeout = float(
             os.getenv(
                 "MEDILENS_LLM_TIMEOUT",
@@ -206,7 +216,14 @@ class LLMService:
         text: str,
         chunk_size: int = 96,
     ):
-        buffer = text.strip()
+        """
+        Streams an already-generated response in small chunks.
+
+        The model is called only once. This preserves the existing
+        frontend streaming interface without making a second LLM call.
+        """
+
+        buffer = (text or "").strip()
 
         if not buffer:
             yield ""
@@ -218,7 +235,7 @@ class LLMService:
             chunk_size,
         ):
             yield buffer[
-                start : start + chunk_size
+                start:start + chunk_size
             ]
 
     # ------------------------------------------------------------------
@@ -236,19 +253,46 @@ class LLMService:
 
         for provider in providers:
             try:
+                print(
+                    f"[LLM] Trying provider={provider}",
+                    flush=True,
+                )
+
                 result = self._generate_with_provider(
                     provider,
                     messages,
                 )
 
                 if result and result.strip():
+                    print(
+                        f"[LLM] Provider={provider} succeeded",
+                        flush=True,
+                    )
+
                     return result.strip()
 
+                raise RuntimeError(
+                    f"{provider} returned an empty response"
+                )
+
             except Exception as exc:
-                # Keep trying the next provider.
                 last_error = exc
 
-        # Never leave the chat request without a response.
+                print(
+                    f"[LLM] Provider '{provider}' failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        print(
+            "[LLM] All configured providers failed. "
+            "Using grounded fallback. "
+            f"Last error: "
+            f"{type(last_error).__name__ if last_error else 'None'}: "
+            f"{last_error if last_error else 'None'}",
+            flush=True,
+        )
+
         return self._grounded_fallback(
             messages,
             fallback_context=fallback_context,
@@ -260,9 +304,39 @@ class LLMService:
     # ------------------------------------------------------------------
 
     def _provider_chain(self) -> list[str]:
+        """
+        Only use providers that are actually configured.
+
+        On Render, Ollama is skipped unless OLLAMA_BASE_URL exists.
+        """
+
         preferred = self.provider
 
-        chain = {
+        groq_available = bool(
+            GROQ_API_KEY
+        )
+
+        openai_available = bool(
+            os.getenv(
+                "OPENAI_API_KEY",
+                "",
+            ).strip()
+        )
+
+        ollama_available = bool(
+            os.getenv(
+                "OLLAMA_BASE_URL",
+                "",
+            ).strip()
+        )
+
+        available = {
+            "groq": groq_available,
+            "openai": openai_available,
+            "ollama": ollama_available,
+        }
+
+        order = {
             "groq": [
                 "groq",
                 "openai",
@@ -280,7 +354,7 @@ class LLMService:
             ],
         }
 
-        return chain.get(
+        candidates = order.get(
             preferred,
             [
                 "groq",
@@ -288,6 +362,22 @@ class LLMService:
                 "ollama",
             ],
         )
+
+        configured = [
+            provider
+            for provider in candidates
+            if available.get(
+                provider,
+                False,
+            )
+        ]
+
+        # Keep Groq in the chain even when the key is missing so
+        # the Render log clearly reports the configuration problem.
+        if not configured:
+            return ["groq"]
+
+        return configured
 
     # ------------------------------------------------------------------
     # Provider dispatcher
@@ -298,6 +388,7 @@ class LLMService:
         provider: str,
         messages: list[dict[str, str]],
     ) -> str:
+
         if provider == "groq":
             return self._generate_with_groq(
                 messages
@@ -325,6 +416,7 @@ class LLMService:
         self,
         messages: list[dict[str, str]],
     ) -> str:
+
         if not GROQ_API_KEY:
             raise RuntimeError(
                 "GROQ_API_KEY is not configured"
@@ -337,6 +429,12 @@ class LLMService:
                 "Groq client is unavailable"
             ) from exc
 
+        print(
+            f"[LLM] Calling Groq model="
+            f"{self.groq_model}",
+            flush=True,
+        )
+
         client = Groq(
             api_key=GROQ_API_KEY,
             timeout=self.request_timeout,
@@ -346,8 +444,9 @@ class LLMService:
             model=self.groq_model,
             messages=messages,
             temperature=self.temperature,
-            max_tokens=700,
-            timeout=self.request_timeout,
+            max_completion_tokens=700,
+            reasoning_effort="low",
+            include_reasoning=False,
         )
 
         if not completion.choices:
@@ -355,11 +454,12 @@ class LLMService:
                 "Groq returned no choices"
             )
 
-        content = (
-            completion
-            .choices[0]
-            .message
-            .content
+        message = completion.choices[0].message
+
+        content = getattr(
+            message,
+            "content",
+            None,
         )
 
         if not content:
@@ -367,7 +467,7 @@ class LLMService:
                 "Groq returned an empty response"
             )
 
-        return content.strip()
+        return str(content).strip()
 
     # ------------------------------------------------------------------
     # OpenAI
@@ -377,10 +477,11 @@ class LLMService:
         self,
         messages: list[dict[str, str]],
     ) -> str:
+
         api_key = os.getenv(
             "OPENAI_API_KEY",
             "",
-        )
+        ).strip()
 
         if not api_key:
             raise RuntimeError(
@@ -403,8 +504,7 @@ class LLMService:
             model=self.openai_model,
             messages=messages,
             temperature=self.temperature,
-            max_tokens=700,
-            timeout=self.request_timeout,
+            max_completion_tokens=700,
         )
 
         if not completion.choices:
@@ -412,11 +512,12 @@ class LLMService:
                 "OpenAI returned no choices"
             )
 
-        content = (
-            completion
-            .choices[0]
-            .message
-            .content
+        message = completion.choices[0].message
+
+        content = getattr(
+            message,
+            "content",
+            None,
         )
 
         if not content:
@@ -424,7 +525,7 @@ class LLMService:
                 "OpenAI returned an empty response"
             )
 
-        return content.strip()
+        return str(content).strip()
 
     # ------------------------------------------------------------------
     # Ollama
@@ -434,10 +535,16 @@ class LLMService:
         self,
         messages: list[dict[str, str]],
     ) -> str:
+
         base_url = os.getenv(
             "OLLAMA_BASE_URL",
-            "http://localhost:11434",
-        )
+            "",
+        ).strip()
+
+        if not base_url:
+            raise RuntimeError(
+                "OLLAMA_BASE_URL is not configured"
+            )
 
         response = requests.post(
             f"{base_url.rstrip('/')}/api/chat",
@@ -457,6 +564,7 @@ class LLMService:
         payload = response.json()
 
         if isinstance(payload, dict):
+
             message = payload.get(
                 "message"
             )
@@ -501,40 +609,272 @@ class LLMService:
         fallback_context: str,
         error: Exception | None,
     ) -> str:
+        """
+        Safe fallback when external LLM providers fail.
+
+        The fallback deliberately avoids dumping the entire report
+        into the chat response.
+        """
+
         user_message = ""
 
         for message in reversed(messages):
             if message.get("role") == "user":
-                user_message = message.get(
-                    "content",
-                    "",
-                )
+                user_message = str(
+                    message.get(
+                        "content",
+                        "",
+                    )
+                ).strip()
                 break
+
+        if not user_message:
+            user_message = "your question"
+
+        answer = self._answer_common_lab_question(
+            user_message=user_message,
+            context=fallback_context,
+        )
+
+        if answer:
+            return answer
 
         context_sentences = self._first_sentences(
             fallback_context,
-            limit=4,
+            limit=2,
         )
 
         if context_sentences:
-            question = self._compact_sentence(
-                user_message
+            return (
+                "I can use the uploaded report as context, "
+                "but the AI language model is temporarily "
+                "unavailable. Please try the question again "
+                "shortly."
             )
 
-            return (
-                "Based on the available clinical context, "
-                f"{question} "
-                f"{' '.join(context_sentences)} "
-                "Please review important findings with "
-                "a licensed clinician."
-            ).strip()
-
         return (
-            "I can only answer using the uploaded report "
-            "and retrieved medical references. "
-            "Please upload a report or ask about a known "
-            "laboratory finding."
+            "The AI language model is temporarily unavailable. "
+            "Please try again shortly."
         )
+
+    # ------------------------------------------------------------------
+    # Simple grounded laboratory fallback
+    # ------------------------------------------------------------------
+
+    def _answer_common_lab_question(
+        self,
+        *,
+        user_message: str,
+        context: str,
+    ) -> str:
+
+        question = (
+            user_message or ""
+        ).lower()
+
+        report = context or ""
+
+        # --------------------------------------------------------------
+        # Hemoglobin
+        # --------------------------------------------------------------
+
+        if (
+            "hemoglobin" in question
+            or "haemoglobin" in question
+        ):
+            match = re.search(
+                r"hemoglobin\s+"
+                r"([0-9]+(?:\.[0-9]+)?)"
+                r"\s*g/dl"
+                r"(?:\s+"
+                r"([0-9]+(?:\.[0-9]+)?)"
+                r"[–-]"
+                r"([0-9]+(?:\.[0-9]+)?))?",
+                report,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                value = float(
+                    match.group(1)
+                )
+
+                low = (
+                    float(match.group(2))
+                    if match.group(2)
+                    else None
+                )
+
+                high = (
+                    float(match.group(3))
+                    if match.group(3)
+                    else None
+                )
+
+                if (
+                    low is not None
+                    and high is not None
+                    and low <= value <= high
+                ):
+                    return (
+                        f"The report shows hemoglobin at "
+                        f"{value:g} g/dL. This is within "
+                        f"the report's reference range of "
+                        f"{low:g}–{high:g} g/dL. "
+                        "Hemoglobin is a protein in red blood "
+                        "cells that carries oxygen."
+                    )
+
+                return (
+                    f"The report shows hemoglobin at "
+                    f"{value:g} g/dL. Whether that is low, "
+                    "normal, or high should be determined "
+                    "using the reference range shown on "
+                    "the report."
+                )
+
+            return (
+                "Hemoglobin is a protein in red blood cells "
+                "that carries oxygen around the body. "
+                "Its result should be interpreted using the "
+                "reference range shown on the report."
+            )
+
+        # --------------------------------------------------------------
+        # MCV
+        # --------------------------------------------------------------
+
+        if "mcv" in question:
+            match = re.search(
+                r"MCV\s+"
+                r"([0-9]+(?:\.[0-9]+)?)"
+                r"\s*fL"
+                r"(?:\s+"
+                r"([0-9]+(?:\.[0-9]+)?)"
+                r"[–-]"
+                r"([0-9]+(?:\.[0-9]+)?))?",
+                report,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                value = float(
+                    match.group(1)
+                )
+
+                low = (
+                    float(match.group(2))
+                    if match.group(2)
+                    else None
+                )
+
+                high = (
+                    float(match.group(3))
+                    if match.group(3)
+                    else None
+                )
+
+                if (
+                    low is not None
+                    and high is not None
+                    and low <= value <= high
+                ):
+                    return (
+                        f"The report shows an MCV of "
+                        f"{value:g} fL, which is within "
+                        f"the report's reference range of "
+                        f"{low:g}–{high:g} fL. "
+                        "MCV describes the average size "
+                        "of red blood cells."
+                    )
+
+            return (
+                "MCV describes the average size of red "
+                "blood cells. The reference range on the "
+                "report should be used to determine "
+                "whether it is low, normal, or high."
+            )
+
+        # --------------------------------------------------------------
+        # Cholesterol
+        # --------------------------------------------------------------
+
+        if (
+            "cholesterol" in question
+            or "ldl" in question
+            or "hdl" in question
+        ):
+            return (
+                "The report includes total cholesterol, LDL, "
+                "HDL, and triglycerides. These measurements "
+                "describe different aspects of blood lipid "
+                "levels. Their results should be interpreted "
+                "using the reference or target ranges shown "
+                "on the report."
+            )
+
+        # --------------------------------------------------------------
+        # Glucose / diabetes
+        # --------------------------------------------------------------
+
+        if (
+            "glucose" in question
+            or "blood sugar" in question
+            or "diabetes" in question
+        ):
+            return (
+                "The report includes a fasting glucose value. "
+                "Fasting glucose measures blood sugar after "
+                "fasting and is one factor clinicians use "
+                "when assessing glucose regulation."
+            )
+
+        # --------------------------------------------------------------
+        # Creatinine / kidney
+        # --------------------------------------------------------------
+
+        if (
+            "creatinine" in question
+            or "kidney" in question
+        ):
+            return (
+                "Creatinine is a blood measurement commonly "
+                "used with other information to assess kidney "
+                "function. The result should be interpreted "
+                "using the report's reference range and the "
+                "person's clinical context."
+            )
+
+        # --------------------------------------------------------------
+        # WBC
+        # --------------------------------------------------------------
+
+        if (
+            "wbc" in question
+            or "white blood" in question
+            or "white cell" in question
+        ):
+            return (
+                "WBC stands for white blood cell count. "
+                "White blood cells are part of the immune "
+                "system. The report's reference range is "
+                "used to determine whether the count is "
+                "within the stated range."
+            )
+
+        # --------------------------------------------------------------
+        # Platelets
+        # --------------------------------------------------------------
+
+        if "platelet" in question:
+            return (
+                "Platelets are blood components involved "
+                "in normal blood clotting. Their result "
+                "should be interpreted against the reference "
+                "range shown on the report."
+            )
+
+        return ""
 
     # ------------------------------------------------------------------
     # Feature context
@@ -544,22 +884,35 @@ class LLMService:
         self,
         top_features: list[dict[str, object]],
     ) -> str:
+
         if not top_features:
             return ""
 
-        return "\n".join(
-            (
-                f"{item.get("
+        lines: list[str] = []
+
+        for item in top_features[:5]:
+
+            parameter = item.get(
                 "parameter",
-                item.get("feature", "Feature")
-                )}: "
-                f"{item.get("
-                "contribution_score",
-                item.get("contribution", 0)
-                )}"
+                item.get(
+                    "feature",
+                    "Feature",
+                ),
             )
-            for item in top_features[:5]
-        )
+
+            contribution = item.get(
+                "contribution_score",
+                item.get(
+                    "contribution",
+                    0,
+                ),
+            )
+
+            lines.append(
+                f"{parameter}: {contribution}"
+            )
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Lifestyle fallback
@@ -570,6 +923,7 @@ class LLMService:
         disease_name: str,
         top_features: list[dict[str, object]],
     ) -> list[str]:
+
         drivers = [
             str(
                 item.get(
@@ -585,28 +939,19 @@ class LLMService:
 
         base = {
             "Anemia": [
-                "Include iron-rich foods with "
-                "vitamin C sources.",
-                "Discuss ferritin and B12 follow-up "
-                "if symptoms persist.",
-                "Avoid self-starting iron supplements "
-                "without clinician guidance.",
+                "Include iron-rich foods with vitamin C sources.",
+                "Discuss ferritin and B12 follow-up if symptoms persist.",
+                "Avoid self-starting iron supplements without clinician guidance.",
             ],
             "Diabetes": [
-                "Choose high-fiber meals and minimize "
-                "sugary drinks.",
-                "Stay physically active if your clinician "
-                "says it is safe.",
-                "Repeat glucose or HbA1c testing as "
-                "recommended.",
+                "Choose high-fiber meals and minimize sugary drinks.",
+                "Stay physically active if your clinician says it is safe.",
+                "Repeat glucose or HbA1c testing as recommended.",
             ],
             "Chronic Kidney Disease": [
-                "Follow blood-pressure and hydration "
-                "guidance from your clinician.",
-                "Review salt intake and avoid unnecessary "
-                "NSAID use.",
-                "Monitor kidney markers and electrolytes "
-                "on follow-up testing.",
+                "Follow blood-pressure and hydration guidance from your clinician.",
+                "Review salt intake and avoid unnecessary NSAID use.",
+                "Monitor kidney markers and electrolytes on follow-up testing.",
             ],
         }.get(
             disease_name,
@@ -636,9 +981,12 @@ class LLMService:
         text: str,
         fallback: list[str],
     ) -> list[str]:
+
         lines = [
             line.strip("-• \t")
-            for line in text.splitlines()
+            for line in (
+                text or ""
+            ).splitlines()
             if line.strip()
         ]
 
@@ -663,6 +1011,7 @@ class LLMService:
         text: str,
         limit: int = 3,
     ) -> list[str]:
+
         sentences = [
             sentence.strip()
             for sentence in re.split(
@@ -682,7 +1031,10 @@ class LLMService:
         self,
         text: str,
     ) -> str:
-        stripped = text.strip()
+
+        stripped = (
+            text or ""
+        ).strip()
 
         if not stripped:
             return ""
