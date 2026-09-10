@@ -38,8 +38,6 @@ class LLMService:
             or "groq"
         ).lower()
 
-        # Current Groq production model.
-        # Can be overridden with MEDILENS_GROQ_MODEL.
         self.groq_model = os.getenv(
             "MEDILENS_GROQ_MODEL",
             "openai/gpt-oss-20b",
@@ -217,10 +215,10 @@ class LLMService:
         chunk_size: int = 96,
     ):
         """
-        Streams an already-generated response in small chunks.
+        Streams an already-generated answer in small chunks.
 
-        The model is called only once. This preserves the existing
-        frontend streaming interface without making a second LLM call.
+        The LLM is called only once. This preserves the existing
+        frontend streaming interface.
         """
 
         buffer = (text or "").strip()
@@ -284,12 +282,23 @@ class LLMService:
                     flush=True,
                 )
 
+        error_type = (
+            type(last_error).__name__
+            if last_error
+            else "None"
+        )
+
+        error_message = (
+            str(last_error)
+            if last_error
+            else "None"
+        )
+
         print(
             "[LLM] All configured providers failed. "
             "Using grounded fallback. "
-            f"Last error: "
-            f"{type(last_error).__name__ if last_error else 'None'}: "
-            f"{last_error if last_error else 'None'}",
+            f"Last error: {error_type}: "
+            f"{error_message}",
             flush=True,
         )
 
@@ -307,7 +316,8 @@ class LLMService:
         """
         Only use providers that are actually configured.
 
-        On Render, Ollama is skipped unless OLLAMA_BASE_URL exists.
+        Ollama is skipped on Render unless OLLAMA_BASE_URL
+        is explicitly configured.
         """
 
         preferred = self.provider
@@ -364,16 +374,16 @@ class LLMService:
         )
 
         configured = [
-            provider
-            for provider in candidates
+            provider_name
+            for provider_name in candidates
             if available.get(
-                provider,
+                provider_name,
                 False,
             )
         ]
 
-        # Keep Groq in the chain even when the key is missing so
-        # the Render log clearly reports the configuration problem.
+        # If no provider is configured, attempt Groq so the
+        # resulting log clearly reports the missing API key.
         if not configured:
             return ["groq"]
 
@@ -388,7 +398,6 @@ class LLMService:
         provider: str,
         messages: list[dict[str, str]],
     ) -> str:
-
         if provider == "groq":
             return self._generate_with_groq(
                 messages
@@ -416,7 +425,6 @@ class LLMService:
         self,
         messages: list[dict[str, str]],
     ) -> str:
-
         if not GROQ_API_KEY:
             raise RuntimeError(
                 "GROQ_API_KEY is not configured"
@@ -477,7 +485,6 @@ class LLMService:
         self,
         messages: list[dict[str, str]],
     ) -> str:
-
         api_key = os.getenv(
             "OPENAI_API_KEY",
             "",
@@ -535,7 +542,6 @@ class LLMService:
         self,
         messages: list[dict[str, str]],
     ) -> str:
-
         base_url = os.getenv(
             "OLLAMA_BASE_URL",
             "",
@@ -564,7 +570,6 @@ class LLMService:
         payload = response.json()
 
         if isinstance(payload, dict):
-
             message = payload.get(
                 "message"
             )
@@ -612,8 +617,8 @@ class LLMService:
         """
         Safe fallback when external LLM providers fail.
 
-        The fallback deliberately avoids dumping the entire report
-        into the chat response.
+        It does not dump the entire medical report into the
+        chat response.
         """
 
         user_message = ""
@@ -639,22 +644,9 @@ class LLMService:
         if answer:
             return answer
 
-        context_sentences = self._first_sentences(
-            fallback_context,
-            limit=2,
-        )
-
-        if context_sentences:
-            return (
-                "I can use the uploaded report as context, "
-                "but the AI language model is temporarily "
-                "unavailable. Please try the question again "
-                "shortly."
-            )
-
         return (
-            "The AI language model is temporarily unavailable. "
-            "Please try again shortly."
+            "The AI language model is temporarily "
+            "unavailable. Please try again shortly."
         )
 
     # ------------------------------------------------------------------
@@ -667,7 +659,6 @@ class LLMService:
         user_message: str,
         context: str,
     ) -> str:
-
         question = (
             user_message or ""
         ).lower()
@@ -721,8 +712,8 @@ class LLMService:
                         f"{value:g} g/dL. This is within "
                         f"the report's reference range of "
                         f"{low:g}–{high:g} g/dL. "
-                        "Hemoglobin is a protein in red blood "
-                        "cells that carries oxygen."
+                        "Hemoglobin is a protein in red "
+                        "blood cells that carries oxygen."
                     )
 
                 return (
@@ -805,12 +796,12 @@ class LLMService:
             or "hdl" in question
         ):
             return (
-                "The report includes total cholesterol, LDL, "
-                "HDL, and triglycerides. These measurements "
-                "describe different aspects of blood lipid "
-                "levels. Their results should be interpreted "
-                "using the reference or target ranges shown "
-                "on the report."
+                "The report includes total cholesterol, "
+                "LDL, HDL, and triglycerides. These "
+                "measurements describe different aspects "
+                "of blood lipid levels. Their results "
+                "should be interpreted using the reference "
+                "or target ranges shown on the report."
             )
 
         # --------------------------------------------------------------
@@ -823,10 +814,11 @@ class LLMService:
             or "diabetes" in question
         ):
             return (
-                "The report includes a fasting glucose value. "
-                "Fasting glucose measures blood sugar after "
-                "fasting and is one factor clinicians use "
-                "when assessing glucose regulation."
+                "The report includes a fasting glucose "
+                "value. Fasting glucose measures blood "
+                "sugar after fasting and is one factor "
+                "clinicians use when assessing glucose "
+                "regulation."
             )
 
         # --------------------------------------------------------------
@@ -839,10 +831,10 @@ class LLMService:
         ):
             return (
                 "Creatinine is a blood measurement commonly "
-                "used with other information to assess kidney "
-                "function. The result should be interpreted "
-                "using the report's reference range and the "
-                "person's clinical context."
+                "used with other information to assess "
+                "kidney function. The result should be "
+                "interpreted using the report's reference "
+                "range and the person's clinical context."
             )
 
         # --------------------------------------------------------------
@@ -870,8 +862,8 @@ class LLMService:
             return (
                 "Platelets are blood components involved "
                 "in normal blood clotting. Their result "
-                "should be interpreted against the reference "
-                "range shown on the report."
+                "should be interpreted against the "
+                "reference range shown on the report."
             )
 
         return ""
@@ -884,14 +876,12 @@ class LLMService:
         self,
         top_features: list[dict[str, object]],
     ) -> str:
-
         if not top_features:
             return ""
 
         lines: list[str] = []
 
         for item in top_features[:5]:
-
             parameter = item.get(
                 "parameter",
                 item.get(
@@ -923,7 +913,6 @@ class LLMService:
         disease_name: str,
         top_features: list[dict[str, object]],
     ) -> list[str]:
-
         drivers = [
             str(
                 item.get(
@@ -981,7 +970,6 @@ class LLMService:
         text: str,
         fallback: list[str],
     ) -> list[str]:
-
         lines = [
             line.strip("-• \t")
             for line in (
@@ -1011,7 +999,6 @@ class LLMService:
         text: str,
         limit: int = 3,
     ) -> list[str]:
-
         sentences = [
             sentence.strip()
             for sentence in re.split(
@@ -1031,7 +1018,6 @@ class LLMService:
         self,
         text: str,
     ) -> str:
-
         stripped = (
             text or ""
         ).strip()
